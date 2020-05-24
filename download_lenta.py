@@ -5,6 +5,7 @@ import logging
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta
 from multiprocessing import cpu_count
+from typing import List
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -22,7 +23,15 @@ class LentaParser:
     # lxml is much faster but error prone
     default_parser = "html.parser"
 
-    def __init__(self, *, max_workers: int, outfile_name: str, from_date: str):
+    def __init__(
+        self,
+        *,
+        max_workers: int,
+        outfile_name: str,
+        from_date: str,
+        with_date: bool = False,
+        with_related_articles: bool = False,
+    ):
         self._endpoint = "https://lenta.ru/news"
 
         self._sess = None
@@ -38,6 +47,9 @@ class LentaParser:
         self._n_downloaded = 0
         self._from_date = datetime.strptime(from_date, "%d.%m.%Y")
 
+        self._with_date = with_date
+        self._with_related_articles = with_related_articles
+
     @property
     def dates_countdown(self):
         date_start, date_end = self._from_date, datetime.today()
@@ -47,11 +59,23 @@ class LentaParser:
             date_start += timedelta(days=1)
 
     @property
+    def _csv_fields(self):
+        base_fields = ["url", "title", "text", "topic", "tags"]
+
+        if self._with_date:
+            base_fields.append("date")
+
+        if self._with_related_articles:
+            base_fields.append("related_articles")
+
+        return base_fields
+
+    @property
     def writer(self):
         if self._csv_writer is None:
             self._outfile = open(self._outfile_name, "w", 1)
             self._csv_writer = csv.DictWriter(
-                self._outfile, fieldnames=["url", "title", "text", "topic", "tags"]
+                self._outfile, fieldnames=self._csv_fields
             )
             self._csv_writer.writeheader()
 
@@ -76,25 +100,42 @@ class LentaParser:
         return await response.text(encoding="utf-8")
 
     @staticmethod
-    def parse_article_html(html: str):
+    def _parse_related_articles(soup: BeautifulSoup) -> List[str]:
+        articles_block = soup.find("section", "b-topic-addition")
+        article_links = []
+
+        if articles_block:
+            article_links = [l.get("href") for l in articles_block.find_all("a")]
+
+        return article_links
+
+    @staticmethod
+    def parse_article_html(html: str, with_related: bool = False):
+        parsed_article = {}
+
         doc_tree = BeautifulSoup(html, LentaParser.default_parser)
         tags = doc_tree.find("a", "item dark active")
-        tags = tags.get_text() if tags else None
+        parsed_article["tags"] = tags.get_text() if tags else None
 
         body = doc_tree.find("div", attrs={"itemprop": "articleBody"})
 
         if not body:
             raise RuntimeError(f"Article body is not found")
 
-        text = " ".join([p.get_text() for p in body.find_all("p")])
+        parsed_article["text"] = " ".join([p.get_text() for p in body.find_all("p")])
 
         topic = doc_tree.find("a", "b-header-inner__block")
-        topic = topic.get_text() if topic else None
+        parsed_article["topic"] = topic.get_text() if topic else None
 
         title = doc_tree.find("h1", attrs={"itemprop": "headline"})
-        title = title.get_text() if title else None
+        parsed_article["title"] = title.get_text() if title else None
 
-        return {"title": title, "text": text, "topic": topic, "tags": tags}
+        if with_related:
+            parsed_article["related_articles"] = LentaParser._parse_related_articles(
+                doc_tree
+            )
+
+        return parsed_article
 
     @staticmethod
     def _extract_urls_from_html(html: str):
@@ -102,7 +143,7 @@ class LentaParser:
         news_list = doc_tree.find_all("div", "item news b-tabloid__topic_news")
         return tuple(f"https://lenta.ru{news.find('a')['href']}" for news in news_list)
 
-    async def _fetch_all_news_on_page(self, html: str):
+    async def _fetch_all_news_on_page(self, html: str, date: datetime):
         # Get news URLs from raw html
         loop = asyncio.get_running_loop()
         news_urls = await loop.run_in_executor(
@@ -120,13 +161,16 @@ class LentaParser:
             except aiohttp.ClientResponseError as exc:
                 logger.error(f"Cannot fetch {exc.request_info.url}: {exc}")
             except asyncio.TimeoutError:
-                logger.exception("Cannot fetch. Timout")
+                logger.exception("Cannot fetch. Timeout")
             else:
                 fetched_raw_news[news_urls[i]] = fetch_res
 
         for url, html in fetched_raw_news.items():
             fetched_raw_news[url] = loop.run_in_executor(
-                self._executor, self.parse_article_html, html
+                self._executor,
+                self.parse_article_html,
+                html,
+                self._with_related_articles,
             )
 
         parsed_news = []
@@ -138,6 +182,8 @@ class LentaParser:
                 logger.exception(f"Cannot parse {url}")
             else:
                 parse_res["url"] = url
+                if self._with_date:
+                    parse_res["date"] = date
                 parsed_news.append(parse_res)
 
         if parsed_news:
@@ -170,7 +216,7 @@ class LentaParser:
             except aiohttp.ClientConnectionError:
                 logger.exception(f"Cannot fetch {news_page_url}")
             else:
-                n_proccessed_news = await self._fetch_all_news_on_page(html)
+                n_proccessed_news = await self._fetch_all_news_on_page(html, date)
 
                 if n_proccessed_news == 0:
                     logger.info(f"News not found at {news_page_url}.")
@@ -205,12 +251,28 @@ def main():
         help="download news from this date. Example: 30.08.1999",
     )
 
+    parser.add_argument(
+        "--with-date",
+        default=False,
+        action="store_true",
+        help="extract dates from news",
+    )
+
+    parser.add_argument(
+        "--with-related-articles",
+        default=False,
+        action="store_true",
+        help="extract related articles from news",
+    )
+
     args = parser.parse_args()
 
     parser = LentaParser(
         max_workers=args.cpu_workers,
         outfile_name=args.outfile,
         from_date=args.from_date,
+        with_date=args.with_date,
+        with_related_articles=args.with_related_articles,
     )
 
     try:
