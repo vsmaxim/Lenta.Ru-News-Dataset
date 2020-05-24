@@ -5,7 +5,7 @@ import logging
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta
 from multiprocessing import cpu_count
-from typing import List
+from typing import List, Optional
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -29,6 +29,7 @@ class LentaParser:
         max_workers: int,
         outfile_name: str,
         from_date: str,
+        to_date: Optional[str] = None,
         with_date: bool = False,
         with_related_articles: bool = False,
     ):
@@ -46,13 +47,14 @@ class LentaParser:
 
         self._n_downloaded = 0
         self._from_date = datetime.strptime(from_date, "%d.%m.%Y")
+        self._to_date = datetime.strptime(to_date, "%d.%m.%Y") if to_date else datetime.today()
 
         self._with_date = with_date
         self._with_related_articles = with_related_articles
 
     @property
     def dates_countdown(self):
-        date_start, date_end = self._from_date, datetime.today()
+        date_start, date_end = self._from_date, self._to_date
 
         while date_start <= date_end:
             yield date_start.strftime("%Y/%m/%d")
@@ -101,13 +103,8 @@ class LentaParser:
 
     @staticmethod
     def _parse_related_articles(soup: BeautifulSoup) -> List[str]:
-        articles_block = soup.find("section", "b-topic-addition")
-        article_links = []
-
-        if articles_block:
-            article_links = [l.get("href") for l in articles_block.find_all("a")]
-
-        return article_links
+        article_links = [l.get("href") for l in soup.find_all("a")]
+        return list(filter(lambda l: l.startswith("https://lenta.ru"), article_links))
 
     @staticmethod
     def parse_article_html(html: str, with_related: bool = False):
@@ -132,7 +129,7 @@ class LentaParser:
 
         if with_related:
             parsed_article["related_articles"] = LentaParser._parse_related_articles(
-                doc_tree
+                body
             )
 
         return parsed_article
@@ -252,6 +249,13 @@ def main():
     )
 
     parser.add_argument(
+        "--to-date",
+        default="30.08.1999",
+        type=str,
+        help="download news until this date. Example: 30.08.1999",
+    )
+
+    parser.add_argument(
         "--with-date",
         default=False,
         action="store_true",
@@ -271,6 +275,7 @@ def main():
         max_workers=args.cpu_workers,
         outfile_name=args.outfile,
         from_date=args.from_date,
+        to_date=args.to_date,
         with_date=args.with_date,
         with_related_articles=args.with_related_articles,
     )
